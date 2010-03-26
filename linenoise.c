@@ -2,7 +2,7 @@
  * line editing lib needs to be 20,000 lines of C code.
  *
  * You can find the latest source code at:
- * 
+ *
  *   http://github.com/antirez/linenoise
  *
  * Does a number of crazy assumptions that happen to be true in 99.9999% of
@@ -65,8 +65,8 @@
  *
  * CUF (CUrsor Forward)
  *    Sequence: ESC [ n C
- *    Effect: moves cursor forward of n chars
- * 
+ *    Effect: moves cursor forward n chars
+ *
  */
 
 #include <termios.h>
@@ -79,6 +79,11 @@
 #include <sys/types.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
+
+#define CSI "\033["  /* Real xterm emulators should support "\233" here. */
+#define CHA_0 CSI"0G"
+#define EL_0 CSI"0K"
+#define CUF CSI"%dC"
 
 #define LINENOISE_MAX_LINE 4096
 static char *unsupported_term[] = {"dumb","cons25",NULL};
@@ -99,7 +104,7 @@ static int isUnsupportedTerm(void) {
 
     if (term == NULL) return 0;
     for (j = 0; unsupported_term[j]; j++)
-        if (!strcasecmp(term,unsupported_term[j])) return 1;
+        if (0 == strcasecmp(term,unsupported_term[j])) return 1;
     return 0;
 }
 
@@ -131,7 +136,7 @@ static int enableRawMode(int fd) {
     raw.c_oflag &= ~(OPOST);
     /* control modes - set 8 bit chars */
     raw.c_cflag |= (CS8);
-    /* local modes - choing off, canonical off, no extended functions,
+    /* local modes - echoing off, canonical off, no extended functions,
      * no signal chars (^Z,^C) */
     raw.c_lflag &= ~(ECHO | ICANON | IEXTEN | ISIG);
     /* control chars - set return condition: min number of bytes and timer.
@@ -167,10 +172,12 @@ static int getColumns(void) {
     return ws.ws_col;
 }
 
-static void refreshLine(int fd, const char *prompt, char *buf, size_t len, size_t pos, size_t cols) {
+static void refreshLine(int fd,
+                        const char *prompt, size_t plen,
+                        const char *buf, size_t len,
+                        size_t pos, size_t cols) {
     char seq[64];
-    size_t plen = strlen(prompt);
-    
+
     while((plen+pos) >= cols) {
         buf++;
         len--;
@@ -181,17 +188,12 @@ static void refreshLine(int fd, const char *prompt, char *buf, size_t len, size_
     }
 
     /* Cursor to left edge */
-    snprintf(seq,64,"\x1b[0G");
-    if (write(fd,seq,strlen(seq)) == -1) return;
+    if (write(fd,CHA_0,sizeof CHA_0 - 1) == -1) return;
     /* Write the prompt and the current buffer content */
-    if (write(fd,prompt,strlen(prompt)) == -1) return;
+    if (write(fd,prompt,plen) == -1) return;
     if (write(fd,buf,len) == -1) return;
-    /* Erase to right */
-    snprintf(seq,64,"\x1b[0K");
-    if (write(fd,seq,strlen(seq)) == -1) return;
-    /* Move cursor to original position. */
-    snprintf(seq,64,"\x1b[0G\x1b[%dC", (int)(pos+plen));
-    if (write(fd,seq,strlen(seq)) == -1) return;
+    /* Erase to right and move cursor to original position. */
+    write(fd,seq,snprintf(seq,sizeof seq,EL_0 CHA_0 CUF, (int)(pos+plen)));
 }
 
 static int linenoisePrompt(int fd, char *buf, size_t buflen, const char *prompt) {
@@ -202,20 +204,17 @@ static int linenoisePrompt(int fd, char *buf, size_t buflen, const char *prompt)
     int history_index = 0;
 
     buf[0] = '\0';
-    buflen--; /* Make sure there is always space for the nulterm */
 
     /* The latest history entry is always our current buffer, that
      * initially is just an empty string. */
     linenoiseHistoryAdd("");
-    
+
     if (write(fd,prompt,plen) == -1) return -1;
     while(1) {
         char c;
-        int nread;
         char seq[2];
 
-        nread = read(fd,&c,1);
-        if (nread <= 0) return len;
+        if (read(fd,&c,1) <= 0) return len;
         switch(c) {
         case 13:    /* enter */
             history_len--;
@@ -233,7 +232,7 @@ static int linenoisePrompt(int fd, char *buf, size_t buflen, const char *prompt)
                 pos--;
                 len--;
                 buf[len] = '\0';
-                refreshLine(fd,prompt,buf,len,pos,cols);
+                refreshLine(fd,prompt,plen,buf,len,pos,cols);
             }
             break;
         case 20:    /* ctrl-t */
@@ -242,7 +241,7 @@ static int linenoisePrompt(int fd, char *buf, size_t buflen, const char *prompt)
                 buf[pos-1] = buf[pos];
                 buf[pos] = aux;
                 if (pos != len-1) pos++;
-                refreshLine(fd,prompt,buf,len,pos,cols);
+                refreshLine(fd,prompt,plen,buf,len,pos,cols);
             }
             break;
         case 2:     /* ctrl-b */
@@ -263,21 +262,21 @@ left_arrow:
                 /* left arrow */
                 if (pos > 0) {
                     pos--;
-                    refreshLine(fd,prompt,buf,len,pos,cols);
+                    refreshLine(fd,prompt,plen,buf,len,pos,cols);
                 }
             } else if (seq[0] == 91 && seq[1] == 67) {
 right_arrow:
                 /* right arrow */
                 if (pos != len) {
                     pos++;
-                    refreshLine(fd,prompt,buf,len,pos,cols);
+                    refreshLine(fd,prompt,plen,buf,len,pos,cols);
                 }
             } else if (seq[0] == 91 && (seq[1] == 65 || seq[1] == 66)) {
 up_down_arrow:
                 /* up and down arrow: history */
                 if (history_len > 1) {
                     /* Update the current history entry before to
-                     * overwrite it with tne next one. */
+                     * overwrite it with the next one. */
                     free(history[history_len-1-history_index]);
                     history[history_len-1-history_index] = strdup(buf);
                     /* Show the new entry */
@@ -289,15 +288,15 @@ up_down_arrow:
                         history_index = history_len-1;
                         break;
                     }
-                    strncpy(buf,history[history_len-1-history_index],buflen);
-                    buf[buflen] = '\0';
-                    len = pos = strlen(buf);
-                    refreshLine(fd,prompt,buf,len,pos,cols);
+                    /* Copy the line, truncating if it is too long. */
+                    len = pos = sprintf(buf, "%.*s", (int)buflen - 1,
+                                        history[history_len-1-history_index]);
+                    refreshLine(fd,prompt,plen,buf,len,pos,cols);
                 }
             }
             break;
         default:
-            if (len < buflen) {
+            if (len < buflen - 1) {
                 if (len == pos) {
                     buf[pos] = c;
                     pos++;
@@ -308,7 +307,7 @@ up_down_arrow:
                          * trivial case. */
                         if (write(fd,&c,1) == -1) return -1;
                     } else {
-                        refreshLine(fd,prompt,buf,len,pos,cols);
+                        refreshLine(fd,prompt,plen,buf,len,pos,cols);
                     }
                 } else {
                     memmove(buf+pos+1,buf+pos,len-pos);
@@ -316,27 +315,27 @@ up_down_arrow:
                     len++;
                     pos++;
                     buf[len] = '\0';
-                    refreshLine(fd,prompt,buf,len,pos,cols);
+                    refreshLine(fd,prompt,plen,buf,len,pos,cols);
                 }
             }
             break;
         case 21: /* Ctrl+u, delete the whole line. */
             buf[0] = '\0';
             pos = len = 0;
-            refreshLine(fd,prompt,buf,len,pos,cols);
+            refreshLine(fd,prompt,plen,buf,len,pos,cols);
             break;
         case 11: /* Ctrl+k, delete from current to end of line. */
             buf[pos] = '\0';
             len = pos;
-            refreshLine(fd,prompt,buf,len,pos,cols);
+            refreshLine(fd,prompt,plen,buf,len,pos,cols);
             break;
         case 1: /* Ctrl+a, go to the start of the line */
             pos = 0;
-            refreshLine(fd,prompt,buf,len,pos,cols);
+            refreshLine(fd,prompt,plen,buf,len,pos,cols);
             break;
         case 5: /* ctrl+e, go to the end of the line */
             pos = len;
-            refreshLine(fd,prompt,buf,len,pos,cols);
+            refreshLine(fd,prompt,plen,buf,len,pos,cols);
             break;
         }
     }
@@ -354,7 +353,7 @@ static int linenoiseRaw(char *buf, size_t buflen, const char *prompt) {
     if (enableRawMode(fd) == -1) return -1;
     count = linenoisePrompt(fd, buf, buflen, prompt);
     disableRawMode(fd);
-    printf("\n");
+    putchar('\n');
     return count;
 }
 
@@ -363,19 +362,13 @@ char *linenoise(const char *prompt) {
     int count;
 
     if (isUnsupportedTerm()) {
-        size_t len;
-
-        printf("%s",prompt);
+        fputs(prompt,stdout);
         fflush(stdout);
-        if (fgets(buf,LINENOISE_MAX_LINE,stdin) == NULL) return NULL;
-        len = strlen(buf);
-        while(len && (buf[len-1] == '\n' || buf[len-1] == '\r')) {
-            len--;
-            buf[len] = '\0';
-        }
+        if (fgets(buf,sizeof buf,stdin) == NULL) return NULL;
+        buf[strcspn(buf,"\r\n")] = '\0';
         return strdup(buf);
     } else {
-        count = linenoiseRaw(buf,LINENOISE_MAX_LINE,prompt);
+        count = linenoiseRaw(buf,sizeof buf,prompt);
         if (count == -1) return NULL;
         return strdup(buf);
     }
@@ -387,14 +380,15 @@ int linenoiseHistoryAdd(const char *line) {
 
     if (history_max_len == 0) return 0;
     if (history == 0) {
-        history = malloc(sizeof(char*)*history_max_len);
+        history = malloc(history_max_len * sizeof *history);
         if (history == NULL) return 0;
-        memset(history,0,(sizeof(char*)*history_max_len));
     }
     linecopy = strdup(line);
     if (!linecopy) return 0;
     if (history_len == history_max_len) {
-        memmove(history,history+1,sizeof(char*)*(history_max_len-1));
+        /* Drop the oldest history line. */
+        free(history[0]);
+        memmove(history,history+1,(history_max_len-1) * sizeof *history);
         history_len--;
     }
     history[history_len] = linecopy;
@@ -403,16 +397,15 @@ int linenoiseHistoryAdd(const char *line) {
 }
 
 int linenoiseHistorySetMaxLen(int len) {
-    char **new;
-
     if (len < 1) return 0;
     if (history) {
         int tocopy = history_len;
+        char **new;
 
-        new = malloc(sizeof(char*)*len);
+        new = malloc(len * sizeof *new);
         if (new == NULL) return 0;
         if (len < tocopy) tocopy = len;
-        memcpy(new,history+(history_max_len-tocopy), sizeof(char*)*tocopy);
+        memcpy(new,history+(history_max_len-tocopy),tocopy * sizeof *new);
         free(history);
         history = new;
     }
